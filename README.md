@@ -2,7 +2,7 @@
 
 Static, client-side reader for the jazz oral-history transcripts behind the
 [people network](https://github.com/thisismattmiller/linked-jazz-2026-network).
-Live at **https://thisismattmiller.github.io/linked-jazz-2026-transcripts/**
+Live at **https://semlab.io/linked-jazz-transcripts/**
 
 - `/` — searchable directory of every transcript
 - `/?t=<docid>` — read one transcript (speaker-attributed turns, page markers)

@@ -28,7 +28,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "site" / "data"
 SEG = DATA / "seg"
-READER = "https://thisismattmiller.github.io/linked-jazz-2026-transcripts/"
+READER = "https://semlab.io/linked-jazz-transcripts/"
 
 INST = {
     "tulane": ("Tulane — Hogan Jazz Archive", "https://jazz.tulane.edu/"),

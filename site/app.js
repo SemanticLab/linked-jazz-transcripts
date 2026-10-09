@@ -148,7 +148,7 @@ async function showDoc(docid) {
   // auto-generated segment labels can be switched off; the choice is remembered
   const reader = app.querySelector(".reader"), segBtn = document.getElementById("segtoggle");
   let segOn = true;
-  try { segOn = localStorage.getItem("lj-segments") !== "off"; } catch (e) { /* private mode */ }
+  try { segOn = localStorage.getItem("lj-segment-labels") !== "off"; } catch (e) { /* private mode */ }
   const paintSeg = () => {
     reader.classList.toggle("no-seg", !segOn);
     segBtn.setAttribute("aria-pressed", String(segOn));
@@ -156,7 +156,7 @@ async function showDoc(docid) {
   };
   segBtn.addEventListener("click", () => {
     segOn = !segOn;
-    try { localStorage.setItem("lj-segments", segOn ? "on" : "off"); } catch (e) { /* private mode */ }
+    try { localStorage.setItem("lj-segment-labels", segOn ? "on" : "off"); } catch (e) { /* private mode */ }
     paintSeg();
   });
   paintSeg();
