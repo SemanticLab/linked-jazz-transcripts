@@ -18,6 +18,15 @@ Live at **https://thisismattmiller.github.io/linked-jazz-2026-transcripts/**
   permalink at Tulane / Hamilton / Smithsonian, or the collection page for
   Rutgers IJS, which has no per-item URLs)
 
+## Look and feel
+
+The UI follows the Linked Jazz design system (Libre Franklin for the
+interface, Newsreader for the voices, one blue, paper and ink; dark theme via
+`data-theme="dark"` or system preference). `site/tokens.css` carries the
+system's tokens, `site/lj.css` is its component stylesheet verbatim, and
+`site/site.css` composes the two pages from them; the mark is
+`site/assets/linked-jazz-mark.png`.
+
 ## How it works
 
 No build step on the site itself: `site/data/t_<fnv1a64(docid)>.json` holds one
