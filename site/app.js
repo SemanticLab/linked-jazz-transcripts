@@ -1,7 +1,10 @@
 /* Transcript reader — fully static, client-side.
    ?t=<docid>       load one transcript (fetched as data/t_<fnv1a64(docid)>.json)
-   #b<page>-<block> highlight + scroll to that block (linked from the network viz)
-   no ?t            searchable directory of all transcripts (data/index.json)   */
+   #b<page>-<block> highlight + scroll to that block (linked from the network viz);
+                    page/block are the corpus coordinates carried in the data (p, b)
+   #s<segment_id>   highlight + scroll to one topic segment (linked from segment search)
+   no ?t            searchable directory of all transcripts (data/index.json)
+   data/seg/<segment_id>.json holds each segment in full for other interfaces   */
 "use strict";
 
 const app = document.getElementById("app");
@@ -66,10 +69,29 @@ async function showDoc(docid) {
     </div>
   </header>`);
 
+  // segment headings keyed by their first block; each block learns its segment
+  const segStart = new Map(), segOf = new Map();
+  (d.segments || []).forEach((sg) => {
+    segStart.set(`${sg.sp}-${sg.sb}`, sg);
+    for (let p = sg.sp; p <= sg.ep; p++) {
+      const pg = d.pages.find((x) => (x.p ?? d.pages.indexOf(x)) === p);
+      if (!pg) continue;
+      pg.blocks.forEach((b, bi) => {
+        const bb = b.b ?? bi;
+        if ((p > sg.sp || bb >= sg.sb) && (p < sg.ep || bb <= sg.eb)) segOf.set(`${p}-${bb}`, sg.id);
+      });
+    }
+  });
+
   d.pages.forEach((pg, pi) => {
+    const p = pg.p ?? pi;
     if (pg.label) H.push(`<div class="pagesep">${esc(pg.label)}</div>`);
     pg.blocks.forEach((b, bi) => {
-      H.push(`<div class="turn ${roleOf(b.s)}" id="b${pi}-${bi}">
+      const bb = b.b ?? bi, key = `${p}-${bb}`, sg = segStart.get(key);
+      if (sg) H.push(`<div class="seghead" id="s${sg.id}">
+        <span class="segchap">${esc(sg.chapter || "")}</span><span class="segtitle">${esc(sg.title || "")}</span>
+        ${sg.period ? `<span class="segper">${esc(sg.period)}</span>` : ""}</div>`);
+      H.push(`<div class="turn ${roleOf(b.s)}" id="b${key}" data-seg="${segOf.get(key) ?? ""}">
         <div class="spk">${esc(b.s)}</div><div class="tx">${esc(b.x)}</div></div>`);
     });
   });
@@ -82,6 +104,12 @@ async function showDoc(docid) {
       el.classList.add("hl");
       el.scrollIntoView({ block: "center" });
     }
+  }
+  const ms = location.hash.match(/^#s(\d+)$/);
+  if (ms) {
+    const head = document.getElementById(`s${ms[1]}`);
+    document.querySelectorAll(`.turn[data-seg="${ms[1]}"]`).forEach((el) => el.classList.add("hlseg"));
+    if (head) { head.classList.add("hl"); head.scrollIntoView({ block: "start" }); }
   }
 }
 

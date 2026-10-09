@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
-"""Build the static transcript-reader data from the ch-jazz-mashup corpus.
+"""Build the static transcript-reader data from the Linked Jazz mashup database.
 
-For every interview transcript across the four collections, emit a slim JSON
-(metadata + speaker-attributed blocks) into site/data/, named by the FNV-1a
-64-bit hash of the doc id — the same hash the reader (and the network viewer's
-evidence store) computes client-side, so ?t=<docid> resolves with no lookup
-table. Also emits site/data/index.json for the browsable directory.
+Reads linked_jazz.sqlite (the audited corpus: documents, pages, blocks, topic
+segments, segment tags, people, story-cluster ids) and writes into site/data/:
+
+  t_<fnv1a64(docid)>.json   one slim transcript: metadata + pages of
+                            speaker-attributed blocks + its segment list
+                            (titles and block ranges, no text)
+  seg/<segment_id>.json     one topic segment with its full text, facets,
+                            people and interview header — what a search
+                            interface fetches to show a result in full
+  index.json                the browsable directory
+
+Block coordinates: every block carries its corpus page index `p` and block
+index `b` (0-based, the same (page, block) pair the database, the network
+evidence and the segments use), and the reader builds its #b<p>-<b> anchors
+from them. Blocks with no text are not emitted but their indices are not
+reused, so anchors never drift.
 
 Usage:
-  uv run python build_transcripts.py [--corpus ~/git/ch-jazz-mashup]
+  uv run python build_transcripts.py [--db ~/git/ch-jazz-mashup/linked_jazz.sqlite]
 """
-import argparse, glob, json, os
+import argparse, json, os, shutil, sqlite3, time
+from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SITE = HERE / "site"
-DATA = SITE / "data"
+DATA = HERE / "site" / "data"
+SEG = DATA / "seg"
+READER = "https://thisismattmiller.github.io/linked-jazz-2026-transcripts/"
 
-COLLECTIONS = [
-    ("tulane", "tulane/data/json", "Tulane — Hogan Jazz Archive",
-     "https://jazz.tulane.edu/"),
-    ("hamilton", "hamilton/data/json", "Hamilton College — Fillius Jazz Archive",
-     "https://litsdigital.hamilton.edu/collections/fillius-jazz-archive"),
-    ("si", "si/data/json", "Smithsonian Jazz Oral History Program",
-     "https://americanhistory.si.edu/explore/projects/smithsonian-jazz/oral-history-program"),
-    ("rutgers", "rutgers/data/ocr_json", "Rutgers — Institute of Jazz Studies",
-     "https://www.libraries.rutgers.edu/collections/institute-jazz-studies"),
-]
+INST = {
+    "tulane": ("Tulane — Hogan Jazz Archive", "https://jazz.tulane.edu/"),
+    "hamilton": ("Hamilton College — Fillius Jazz Archive",
+                 "https://litsdigital.hamilton.edu/collections/fillius-jazz-archive"),
+    "si": ("Smithsonian Jazz Oral History Program",
+           "https://americanhistory.si.edu/explore/projects/smithsonian-jazz/oral-history-program"),
+    "rutgers": ("Rutgers — Institute of Jazz Studies",
+                "https://www.libraries.rutgers.edu/collections/institute-jazz-studies"),
+}
+SKIP_TYPES = {"removed_duplicate"}        # text blanked in the corpus: same recording kept elsewhere
 
 
 def fnv1a64(s):
@@ -37,61 +50,120 @@ def fnv1a64(s):
     return f"{h:016x}"
 
 
+def dumps(o):
+    return json.dumps(o, ensure_ascii=False, separators=(",", ":"))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", default=os.path.expanduser("~/git/ch-jazz-mashup"))
+    ap.add_argument("--db", default=os.path.expanduser("~/git/ch-jazz-mashup/linked_jazz.sqlite"))
     args = ap.parse_args()
-    corpus = Path(os.path.expanduser(args.corpus))
+    con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    t0 = time.time()
 
-    DATA.mkdir(parents=True, exist_ok=True)
-    index = []
-    n_docs, n_blocks, total_bytes = 0, 0, 0
+    # fresh output: stale hashes from removed docs must not linger
+    if DATA.exists():
+        shutil.rmtree(DATA)
+    SEG.mkdir(parents=True)
 
-    for coll, rel, inst_label, inst_url in COLLECTIONS:
-        for p in sorted(glob.glob(str(corpus / rel / "*.json"))):
-            b = os.path.basename(p)
-            if "manifest" in b or "Placeholder" in b:
+    tags = defaultdict(lambda: {"places": [], "venues": [], "bands": []})
+    KIND = {"place": "places", "venue": "venues", "band": "bands"}
+    for r in con.execute("SELECT segment_id, kind, name_canonical, qualifier, parent, focus "
+                         "FROM segment_tags ORDER BY segment_id, focus DESC, tag_id"):
+        t = {"name": r["name_canonical"], "focus": r["focus"]}
+        if r["kind"] == "place":
+            t["type"] = r["qualifier"]
+            if r["parent"]:
+                t["in"] = r["parent"]
+        elif r["kind"] == "venue":
+            t["city"] = r["qualifier"]
+        else:
+            t["leader"] = r["qualifier"]
+        lst = tags[r["segment_id"]][KIND[r["kind"]]]
+        if all(x["name"] != t["name"] for x in lst):
+            lst.append(t)
+    people = defaultdict(list)
+    for r in con.execute("SELECT segment_id, person, qid, mentions FROM v_segment_people "
+                         "ORDER BY segment_id, mentions DESC"):
+        people[r["segment_id"]].append({"name": r["person"], "qid": r["qid"], "n": r["mentions"]})
+    story = {}
+    for r in con.execute("SELECT segment_id, level, cluster_id, member FROM segment_story_clusters "
+                         "WHERE level IN ('theme','community')"):
+        story.setdefault(r["segment_id"], {})[r["level"]] = r["cluster_id"]
+        if r["level"] == "community":
+            story[r["segment_id"]]["core"] = r["member"] == "core"
+    story_names = {(r["level"], r["cluster_id"]): r["name"] for r in con.execute(
+        "SELECT level, cluster_id, name FROM story_clusters")}
+
+    index, n_docs, n_blocks, n_segs, total = [], 0, 0, 0, 0
+    docs = con.execute("SELECT * FROM documents ORDER BY collection, doc_id").fetchall()
+    for d in docs:
+        docid = d["doc_id"]
+        pages = {r["page"]: r["page_label"] or "" for r in con.execute(
+            "SELECT page, page_label FROM pages WHERE doc_id=? ORDER BY page", (docid,))}
+        by_page = defaultdict(list)
+        blk_text = {}
+        for r in con.execute("SELECT page, block, type, speaker, text FROM blocks WHERE doc_id=? "
+                             "ORDER BY page, block", (docid,)):
+            txt = (r["text"] or "").strip()
+            if not txt or r["type"] in SKIP_TYPES:
                 continue
-            d = json.load(open(p))
-            if not isinstance(d, dict) or not d.get("pages"):
-                continue
-            docid = d.get("id") or b
-            pages = []
-            blocks = 0
-            for pg in d["pages"]:
-                pb = [{"s": blk.get("speaker") or "", "x": blk.get("text") or ""}
-                      for blk in (pg.get("blocks") or []) if (blk.get("text") or "").strip()]
-                if pb:
-                    pages.append({"label": pg.get("page_label") or "", "blocks": pb})
-                    blocks += len(pb)
-            if not blocks:
-                continue
-            doc = {
-                "id": docid,
-                "title": d.get("title") or docid,
-                "collection": coll,
-                "inst": inst_label,
-                "inst_url": inst_url,
-                "interviewee": (d.get("interviewee") or "").strip(),
-                "interviewer": (d.get("interviewer") or "").strip(),
-                "date": d.get("date") or "",
-                "year": d.get("year") or "",
-                "source_url": d.get("source_url") or "",
-                "pages": pages,
-            }
-            out = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
-            (DATA / f"t_{fnv1a64(docid)}.json").write_text(out)
-            total_bytes += len(out.encode())
-            n_docs += 1
-            n_blocks += blocks
-            index.append({"id": docid, "t": doc["title"], "iv": doc["interviewee"],
-                          "y": doc["year"], "c": coll, "n": blocks})
+            b = {"b": r["block"], "s": r["speaker"] or "", "x": txt}
+            by_page[r["page"]].append(b)
+            blk_text[(r["page"], r["block"])] = b
+        if not blk_text:
+            continue
+        page_list = [{"p": p, "label": pages.get(p, ""), "blocks": by_page[p]}
+                     for p in sorted(by_page)]
+        segs = con.execute("SELECT * FROM segments WHERE doc_id=? ORDER BY ord", (docid,)).fetchall()
+        inst, inst_url = INST[d["collection"]]
+        head = {"id": docid, "title": d["title"] or docid, "collection": d["collection"],
+                "inst": inst, "inst_url": inst_url,
+                "interviewee": d["interviewee"] or "", "interviewer": d["interviewer"] or "",
+                "date": d["date"] or "", "year": d["year"] or "", "source_url": d["source_url"] or ""}
+        seg_meta = []
+        for i, s in enumerate(segs):
+            sid = s["segment_id"]
+            seg_meta.append({"id": sid, "ord": s["ord"], "chapter": s["chapter"], "title": s["title"],
+                             "category": s["category"], "summary": s["summary"], "period": s["period"],
+                             "sp": s["start_page"], "sb": s["start_block"],
+                             "ep": s["end_page"], "eb": s["end_block"], "words": s["words"]})
+            blocks = [{"p": p, **b} for (p, bb), b in sorted(blk_text.items())
+                      if (s["start_page"], s["start_block"]) <= (p, bb) <= (s["end_page"], s["end_block"])]
+            st = story.get(sid, {})
+            seg = {"id": sid, "ord": s["ord"], "n_segments": len(segs),
+                   "prev": segs[i - 1]["segment_id"] if i else None,
+                   "next": segs[i + 1]["segment_id"] if i + 1 < len(segs) else None,
+                   "doc": {**{k: head[k] for k in ("id", "title", "collection", "inst", "interviewee",
+                                                   "interviewer", "date", "year", "source_url")},
+                           "url": f"{READER}?t={docid}"},
+                   "chapter": s["chapter"], "title": s["title"], "category": s["category"],
+                   "summary": s["summary"], "period": s["period"],
+                   "year_from": s["year_from"], "year_to": s["year_to"], "words": s["words"],
+                   "start": [s["start_page"], s["start_block"]], "end": [s["end_page"], s["end_block"]],
+                   "url": f"{READER}?t={docid}#s{sid}",
+                   "tags": tags.get(sid, {"places": [], "venues": [], "bands": []}),
+                   "people": people.get(sid, []),
+                   "story": ({"theme": st.get("theme"), "theme_name": story_names.get(("theme", st.get("theme"))),
+                              "community": st.get("community"),
+                              "community_name": story_names.get(("community", st.get("community"))),
+                              "core": st.get("core")} if st else None),
+                   "blocks": blocks}
+            out = dumps(seg)
+            (SEG / f"{sid}.json").write_text(out)
+            total += len(out.encode()); n_segs += 1
+        doc = {**head, "pages": page_list, "segments": seg_meta}
+        out = dumps(doc)
+        (DATA / f"t_{fnv1a64(docid)}.json").write_text(out)
+        total += len(out.encode()); n_docs += 1; n_blocks += len(blk_text)
+        index.append({"id": docid, "t": doc["title"], "iv": doc["interviewee"], "y": doc["year"],
+                      "c": d["collection"], "n": len(blk_text), "ns": len(segs)})
 
     index.sort(key=lambda r: (r["t"] or "").lower())
-    (DATA / "index.json").write_text(
-        json.dumps(index, ensure_ascii=False, separators=(",", ":")))
-    print(f"{n_docs:,} transcripts · {n_blocks:,} blocks · "
-          f"{total_bytes/1e6:.0f} MB in {DATA}")
+    (DATA / "index.json").write_text(dumps(index))
+    print(f"{n_docs:,} transcripts · {n_blocks:,} blocks · {n_segs:,} segments · "
+          f"{total/1e6:.0f} MB in {DATA}  [{time.time()-t0:.0f}s]")
 
 
 if __name__ == "__main__":
